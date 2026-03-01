@@ -1,0 +1,7 @@
+torch
+wandb
+tiktoken
+numpy
+datasets
+tqdm
+kernels
