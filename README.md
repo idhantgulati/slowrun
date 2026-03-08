@@ -70,6 +70,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 3 | 3.218 | Use value projections and swiglu activation | 03/02/26 | 6h 54m | [Script](https://github.com/qlabs-eng/slowrun/blob/4681cfd6fa8266fc6cbbf2af947773e188599857/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 4 | 3.185 | Add U-Net and Attention Gating | 03/04/26 | 7h 8m | [Script](https://github.com/qlabs-eng/slowrun/blob/bfe12a71d84a4102dcd1a2faaedfbd9aa1c417c0/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna), [@em-see-squared](https://github.com/em-see-squared)
 5 | 3.166 | Train each model for 1.5x longer | 03/05/26 | 10h 35m | [Script](https://github.com/qlabs-eng/slowrun/blob/6848b4a7b4d1373dead2c7ceaaf47927762b86c8/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+6 | 3.126 | Train each model in ensemble to distill previous model + usual CE loss | 03/07/26 | 16h 1m | [Script](https://github.com/qlabs-eng/slowrun/blob/4eb2cce258b9edb97862f65349e130507d7c433c/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 
 
 
