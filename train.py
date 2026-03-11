@@ -51,18 +51,13 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--dupe-start-epoch", type=int, default=0,
-                    help="Epoch to enable layer duplication (0=3 before end)")
+parser.add_argument("--dupe-start-epoch", type=int, default=10,
+                    help="Epoch to enable layer duplication")
 parser.add_argument("--dupe-layers-start", type=int, default=15,
                     help="First decoder layer to duplicate (inclusive)")
 parser.add_argument("--dupe-layers-end", type=int, default=21,
                     help="Last decoder layer to duplicate (exclusive)")
-parser.add_argument("--max-train-seconds", type=float, default=0,
-                    help="Wall-clock cutoff in seconds (0=disabled)")
 args = parser.parse_args()
-
-if args.dupe_start_epoch == 0:
-    args.dupe_start_epoch = max(1, args.num_epochs - 2)
 
 # Resolve output path
 if args.output_json and not args.save_result:
@@ -801,13 +796,13 @@ wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
 min_val_bpb = val_bpb
 min_val_loss = val_loss
 model.train()
-train_start = time.time()
 
 while current_epoch <= args.num_epochs:
     if not dupe_active and current_epoch >= args.dupe_start_epoch:
         print0(f"\n=== Enabling dupe-layers at epoch {current_epoch} ===")
         orig_model.set_dupe_layers(args.dupe_layers_start, args.dupe_layers_end)
-        model = orig_model  # eager mode — no recompile delay
+        model = torch.compile(orig_model, dynamic=False) 
+        # model = orig_model # replace compile with this line for eager mode
         dupe_active = True
         gc.enable(); gc.collect()
 
@@ -850,10 +845,6 @@ while current_epoch <= args.num_epochs:
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
 
-    if args.max_train_seconds > 0 and (time.time() - train_start) >= args.max_train_seconds:
-        print0(f"\n=== Wall-clock cutoff at {time.time() - train_start:.1f}s ===")
-        break
-
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
         epoch_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
@@ -888,19 +879,6 @@ while current_epoch <= args.num_epochs:
     # GC management
     if step == 1:
         gc.collect(); gc.freeze(); gc.disable()
-
-# Final val eval — always runs after training loop exits
-print0(f"\n--- Final eval (step {step}, dupe_active={dupe_active}) ---")
-model.eval()
-val_loader = build_val_loader()
-with autocast_ctx:
-    val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-dupe_str = " [DUPE]" if dupe_active else ""
-print0(f"Final Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}{dupe_str}")
-wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
-if val_bpb < min_val_bpb:
-    min_val_bpb = val_bpb
-    min_val_loss = val_loss
 
 # Summary
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
