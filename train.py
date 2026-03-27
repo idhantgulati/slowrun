@@ -63,7 +63,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=None,
                     help="Override warmdown ratio (default 0.4)")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
-parser.add_argument("--logit-avg", type=int, default=3,
+parser.add_argument("--logit-what avg", type=int, default=3,
                     help="Number of late checkpoints for logit (probability) averaging (0=disabled)")
 parser.add_argument("--logit-avg-dir", type=str, default="logit_avg_ckpts",
                     help="Directory to save/load epoch checkpoints for logit averaging")
@@ -72,6 +72,15 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
+parser.add_argument("--pretrained-ckpt", type=str, default=None,
+                    help="Path to NCA pre-pre-trained checkpoint (pre_pre_train.py output). "
+                         "Loads all weights except embed and lm_head (different vocab sizes).")
+parser.add_argument("--max-train-time", type=float, default=None,
+                    help="Max cumulative training step time in minutes (None = unlimited). "
+                         "Counts only forward+backward pass time, excludes eval and checkpoint saving.")
+parser.add_argument("--max-wall-time", type=float, default=None,
+                    help="Max total wall-clock time in minutes (None = unlimited). "
+                         "Measured from script start, includes eval and checkpoint saving.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -845,6 +854,21 @@ with torch.device("meta"):
 model.to_empty(device=device)
 model.init_weights()
 
+# Load NCA pre-pre-trained weights (skipping embed + lm_head — different vocab sizes)
+if args.pretrained_ckpt:
+    print0(f"Loading NCA pre-pre-trained checkpoint: {args.pretrained_ckpt}")
+    ckpt = torch.load(args.pretrained_ckpt, map_location="cpu", weights_only=True)
+    ckpt.pop('config', None)  # remove metadata dict if present
+    skip_prefixes = ('transformer.wte.', 'lm_head.')
+    filtered = {k: v for k, v in ckpt.items()
+                if not any(k.startswith(p) for p in skip_prefixes)}
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    print0(f"  Loaded {len(filtered)} param tensors; skipped embed+lm_head (vocab size mismatch)")
+    print0(f"  Freshly initialized: {missing}")
+    if unexpected:
+        print0(f"  WARNING — unexpected keys: {unexpected}")
+    del ckpt, filtered
+
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
 ve_params = sum(p.numel() for p in model.ve_projs.parameters())
@@ -898,6 +922,7 @@ min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
+total_step_time = 0.0
 timed_steps = 0
 timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
@@ -957,6 +982,15 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     dt = time.time() - t0
 
     step += 1
+    total_step_time += dt
+
+    # Time-based stopping
+    if args.max_train_time is not None and total_step_time > args.max_train_time * 60:
+        print0(f"Reached max train time ({args.max_train_time}m) at step {step}, stopping.")
+        break
+    if args.max_wall_time is not None and (time.time() - _script_start) > args.max_wall_time * 60:
+        print0(f"Reached max wall time ({args.max_wall_time}m) at step {step}, stopping.")
+        break
 
     # Logging
     ema_beta = 0.9
@@ -970,7 +1004,9 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         timed_steps += 1
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
     dupe_str = " [DUPE]" if dupe_active else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
+    train_t_str = f" | train_t: {total_step_time/60:.2f}m"
+    wall_t_str = f" | wall_t: {(time.time() - _script_start)/60:.2f}m"
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{train_t_str}{wall_t_str}{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
