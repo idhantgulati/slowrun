@@ -63,7 +63,7 @@ parser.add_argument("--warmdown-ratio", type=float, default=None,
                     help="Override warmdown ratio (default 0.4)")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
-parser.add_argument("--logit-what avg", type=int, default=3,
+parser.add_argument("--logit-avg", type=int, default=3,
                     help="Number of late checkpoints for logit (probability) averaging (0=disabled)")
 parser.add_argument("--logit-avg-dir", type=str, default="logit_avg_ckpts",
                     help="Directory to save/load epoch checkpoints for logit averaging")
