@@ -75,6 +75,9 @@ parser.add_argument("--eval-logit-avg", action="store_true",
 parser.add_argument("--pretrained-ckpt", type=str, default=None,
                     help="Path to NCA pre-pre-trained checkpoint (pre_pre_train.py output). "
                          "Loads all weights except embed and lm_head (different vocab sizes).")
+parser.add_argument("--nca-warmup-steps", type=int, default=0,
+                    help="Steps to freeze transformer body (Muon + scalar groups) and train only "
+                         "embed+lm_head after NCA pre-pretraining. Paper uses ~10-20%% of total steps.")
 parser.add_argument("--max-train-time", type=float, default=None,
                     help="Max cumulative training step time in minutes (None = unlimited). "
                          "Counts only forward+backward pass time, excludes eval and checkpoint saving.")
@@ -372,8 +375,8 @@ class GPT(nn.Module):
         skip_params = [self.skip_weights]
 
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=lm_head_params, nca_embed=True, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', params=embed_params, nca_embed=True, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=ve_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
@@ -682,9 +685,9 @@ class DataLoader:
 def evaluate_bpb(model, batches, steps, token_bytes):
     """Compute bits per byte and mean cross-entropy loss on a set of batches."""
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
-    total_bytes = torch.tensor(0, dtype=torch.int64, device=model.get_device())
+    total_bytes = torch.tensor(0.0, dtype=torch.float64, device=model.get_device())
     total_loss = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
-    total_tokens = torch.tensor(0, dtype=torch.int64, device=model.get_device())
+    total_tokens = torch.tensor(0.0, dtype=torch.float64, device=model.get_device())
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y, _ = next(batch_iter)
@@ -703,6 +706,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
     total_nats, total_bytes = total_nats.item(), total_bytes.item()
     total_loss, total_tokens = total_loss.item(), total_tokens.item()
+    print0(f"  [DEBUG] total_loss={total_loss:.6e}, total_tokens={total_tokens}, total_nats={total_nats:.6e}, total_bytes={total_bytes}")
     bpb = total_nats / (math.log(2) * total_bytes) if total_bytes > 0 else float('inf')
     loss = total_loss / total_tokens if total_tokens > 0 else float('inf')
     return bpb, loss
@@ -748,9 +752,9 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
 
     # Compute metrics from accumulated target probs using running totals
     total_nats   = torch.tensor(0.0, dtype=torch.float64, device=dev)
-    total_bytes  = torch.tensor(0, dtype=torch.int64, device=dev)
+    total_bytes  = torch.tensor(0.0, dtype=torch.float64, device=dev)
     total_loss   = torch.tensor(0.0, dtype=torch.float64, device=dev)
-    total_tokens = torch.tensor(0, dtype=torch.int64, device=dev)
+    total_tokens = torch.tensor(0.0, dtype=torch.float64, device=dev)
 
     for i, y in enumerate(all_y):
         y_flat = y.view(-1).to(dev)
@@ -971,8 +975,17 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
+    nca_warmup = args.nca_warmup_steps if args.pretrained_ckpt else 0
+    in_nca_warmup = nca_warmup > 0 and step <= nca_warmup
+    if in_nca_warmup and step == 1:
+        print0(f"NCA embedding warmup: freezing transformer body for {nca_warmup} steps")
+    if nca_warmup > 0 and step == nca_warmup + 1:
+        print0(f"NCA embedding warmup complete at step {step - 1}; unfreezing transformer body")
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+        if in_nca_warmup and not group.get('nca_embed', False):
+            group["lr"] = 0.0
+        else:
+            group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
@@ -1076,8 +1089,8 @@ if logit_avg_count > 0:
         n = len(ckpt_paths_for_logit)
         print0(f"\n--- Evaluating logit avg ({n} checkpoints: {[os.path.basename(p) for p in ckpt_paths_for_logit]}) ---")
 
-        la_model = torch.compile(orig_model, dynamic=False)
-        la_model.eval()
+        orig_model.eval()
+        la_model = orig_model
 
         def _run_mode(label, weights):
             print0(f"  [{label}] weights: {[f'{w:.3f}' for w in weights]}")

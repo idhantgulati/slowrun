@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch import Tensor
+import wandb
 
 # =============================================================================
 # CLI Arguments
@@ -81,7 +82,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL")
 parser.add_argument("--logit-cap", type=float, default=10.0)
 
 # Training
-parser.add_argument("--device-batch-size", type=int, default=16)
+parser.add_argument("--device-batch-size", type=int, default=4)
 parser.add_argument("--total-batch-size", type=int, default=131072, help="Total tokens per optimizer step")
 parser.add_argument("--lr", type=float, default=3e-4)
 parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -90,7 +91,7 @@ parser.add_argument("--warmup-ratio", type=float, default=0.05)
 parser.add_argument("--warmdown-ratio", type=float, default=0.2)
 parser.add_argument("--max-train-time", type=float, default=None,
                     help="Max cumulative training step time in minutes (None = unlimited). "
-                         "Counts only optimizer step time, excludes eval and data generation.")
+                         "Counts forward+backward+optimizer time per step; excludes eval, checkpointing, and startup.")
 parser.add_argument("--max-wall-time", type=float, default=None,
                     help="Max total wall-clock time in minutes (None = unlimited). "
                          "Measured from script start, includes eval and data generation.")
@@ -98,6 +99,7 @@ parser.add_argument("--max-wall-time", type=float, default=None,
 # Output
 parser.add_argument("--save-dir", type=str, default="nca_ckpts")
 parser.add_argument("--run", type=str, default=None)
+parser.add_argument("--wandb-group", type=str, default=None)
 
 args = parser.parse_args()
 _script_start = time.time()
@@ -547,6 +549,22 @@ class GPT(nn.Module):
         cos, sin = freqs.cos().bfloat16(), freqs.sin().bfloat16()
         return cos[None, :, None, :], sin[None, :, None, :]
 
+    def _avg_causal_attended_keys(self, window, seq_len):
+        if window < 0 or window >= seq_len - 1:
+            return (seq_len + 1) / 2
+        max_keys = min(window + 1, seq_len)
+        return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
+
+    def estimate_flops(self):
+        nparams = sum(p.numel() for p in self.parameters())
+        nparams_exclude = (self.transformer.wte.weight.numel()
+                          + self.resid_lambdas.numel()
+                          + self.x0_lambdas.numel()
+                          + self.skip_weights.numel())
+        h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
+        return 6 * (nparams - nparams_exclude) + attn_flops
+
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
         long_w, short_w = config.sequence_len, config.sequence_len // 2
@@ -799,6 +817,16 @@ model      = torch.compile(model, dynamic=False)
 if ddp:
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
+# GPU peak FLOPs for MFU
+gpu_peak_flops = float('inf')
+if device_type == "cuda":
+    gpu_name = torch.cuda.get_device_name(0).lower()
+    if "h100" in gpu_name:   gpu_peak_flops = 989e12
+    elif "a100" in gpu_name: gpu_peak_flops = 312e12
+    elif "4090" in gpu_name: gpu_peak_flops = 165.2e12
+num_flops_per_token = orig_model.estimate_flops()
+print0(f"FLOPs per token: {num_flops_per_token:e}")
+
 # Optimizer (standard AdamW — simpler than Muon, fine for NCA phase)
 optimizer = torch.optim.AdamW(
     orig_model.parameters(), lr=args.lr,
@@ -849,6 +877,15 @@ if args.max_wall_time:
     print0(f"  Max wall time:  {args.max_wall_time}m")
 print0(f"{'='*60}\n")
 
+# wandb
+run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
+_wandb_kwargs = {"project": "nanochat", "name": run_name}
+if args.wandb_group:
+    _wandb_kwargs["group"] = args.wandb_group
+wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
+if master_process:
+    wandb_run.log_code(".")
+
 best_val_loss   = float('inf')
 step            = 0
 smooth_loss     = 0.0
@@ -877,6 +914,7 @@ for epoch in range(args.num_epochs):
     micro_step = 0
     loss_accum = 0.0
     time_limit_hit = False
+    t0 = time.time()
 
     for x, y in train_loader:
         x, y = x.to(device), y.to(device)
@@ -888,9 +926,6 @@ for epoch in range(args.num_epochs):
         micro_step += 1
 
         if micro_step % grad_accum_steps == 0:
-            synchronize()
-            t0 = time.time()
-
             lr = get_lr(step, num_total_steps, args.lr, args.warmup_ratio, args.warmdown_ratio)
             for g in optimizer.param_groups:
                 g['lr'] = lr
@@ -900,6 +935,7 @@ for epoch in range(args.num_epochs):
             synchronize()
             dt = time.time() - t0
             total_step_time += dt
+            t0 = time.time()
 
             step += 1
             ema_beta    = 0.9
@@ -907,10 +943,12 @@ for epoch in range(args.num_epochs):
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * step_loss
             debiased    = smooth_loss / (1 - ema_beta ** step)
             tok_per_sec = int(effective_batch / max(dt, 1e-6))
+            mfu         = 100 * num_flops_per_token * effective_batch / max(dt, 1e-6) / (gpu_peak_flops * ddp_world_size)
             train_t_str = f" | train_t: {total_step_time/60:.2f}m"
             wall_t_str  = f" | wall_t: {(time.time() - _script_start)/60:.2f}m"
             print0(f"  step {step:05d} | ep {epoch+1:02d} | loss {debiased:.6f} | "
-                   f"lr {lr:.2e} | {tok_per_sec:,} tok/s{train_t_str}{wall_t_str}")
+                   f"lr {lr:.2e} | {tok_per_sec:,} tok/s | bf16_mfu: {mfu:.2f}%{train_t_str}{wall_t_str}")
+            wandb_run.log({"step": step, "train/loss": debiased, "train/lr": lr, "train/tok_per_sec": tok_per_sec, "train/mfu": mfu})
             loss_accum = 0.0
 
             if not gc_frozen and step == 1:
@@ -934,6 +972,7 @@ for epoch in range(args.num_epochs):
         ddp, ddp_rank, ddp_world_size)
     is_best = val_loss < best_val_loss
     print0(f"Epoch {epoch+1:02d} | Val Loss: {val_loss:.6f}{' *** BEST' if is_best else ''}")
+    wandb_run.log({"step": step, "epoch": epoch + 1, "val/loss": val_loss})
 
     if is_best:
         best_val_loss = val_loss
@@ -954,6 +993,9 @@ print0(f"  Best val loss:  {best_val_loss:.6f}")
 print0(f"  Wall time:      {total_wall:.1f}s ({total_wall/60:.2f}m)")
 print0(f"  Checkpoint:     {os.path.join(args.save_dir, 'nca_pretrained_best.pt')}")
 print0(f"{'='*60}")
+
+wandb_run.summary["best_val_loss"] = best_val_loss
+wandb_run.finish()
 
 if ddp and dist.is_initialized():
     dist.destroy_process_group()
