@@ -904,25 +904,32 @@ for epoch in range(args.num_epochs):
             shuffle=True, seed=epoch)
         train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=args.device_batch_size, sampler=sampler,
-            drop_last=True, pin_memory=(device_type == "cuda"))
+            drop_last=True, pin_memory=(device_type == "cuda"),
+            num_workers=2, persistent_workers=True)
     else:
         train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=args.device_batch_size,
-            shuffle=True, drop_last=True, pin_memory=(device_type == "cuda"))
+            shuffle=True, drop_last=True, pin_memory=(device_type == "cuda"),
+            num_workers=2, persistent_workers=True)
 
     model.train()
     micro_step = 0
-    loss_accum = 0.0
+    loss_accum_t = torch.zeros(1, device=device)  # accumulate on GPU; single .item() after sync
     time_limit_hit = False
     t0 = time.time()
 
     for x, y in train_loader:
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-        with autocast_ctx:
-            loss = model(x, y)
-        (loss / grad_accum_steps).backward()
-        loss_accum += loss.detach().item()
+        # Skip DDP gradient sync on all but the last micro-step to avoid
+        # (grad_accum_steps - 1) unnecessary all-reduces per optimizer step.
+        is_last_micro = (micro_step + 1) % grad_accum_steps == 0
+        _sync_ctx = nullcontext() if (is_last_micro or not ddp) else model.no_sync()
+        with _sync_ctx:
+            with autocast_ctx:
+                loss = model(x, y)
+            (loss / grad_accum_steps).backward()
+        loss_accum_t += loss.detach()
         micro_step += 1
 
         if micro_step % grad_accum_steps == 0:
@@ -939,7 +946,7 @@ for epoch in range(args.num_epochs):
 
             step += 1
             ema_beta    = 0.9
-            step_loss   = loss_accum / grad_accum_steps
+            step_loss   = loss_accum_t.item() / grad_accum_steps  # single .item() after GPU sync
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * step_loss
             debiased    = smooth_loss / (1 - ema_beta ** step)
             tok_per_sec = int(effective_batch / max(dt, 1e-6))
@@ -949,7 +956,7 @@ for epoch in range(args.num_epochs):
             print0(f"  step {step:05d} | ep {epoch+1:02d} | loss {debiased:.6f} | "
                    f"lr {lr:.2e} | {tok_per_sec:,} tok/s | bf16_mfu: {mfu:.2f}%{train_t_str}{wall_t_str}")
             wandb_run.log({"step": step, "train/loss": debiased, "train/lr": lr, "train/tok_per_sec": tok_per_sec, "train/mfu": mfu})
-            loss_accum = 0.0
+            loss_accum_t.zero_()
 
             if not gc_frozen and step == 1:
                 gc.collect(); gc.freeze(); gc.disable()
