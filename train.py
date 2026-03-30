@@ -78,6 +78,15 @@ parser.add_argument("--pretrained-ckpt", type=str, default=None,
 parser.add_argument("--nca-warmup-steps", type=int, default=0,
                     help="Steps to freeze transformer body (Muon + scalar groups) and train only "
                          "embed+lm_head after NCA pre-pretraining. Paper uses ~10-20%% of total steps.")
+parser.add_argument("--nca-rampup-steps", type=int, default=200,
+                    help="After NCA warmup, linearly ramp transformer body LR from 0 to full over this "
+                         "many steps. Prevents pretrained features from being destroyed by abrupt full LR.")
+parser.add_argument("--nca-load-mode", type=str, default="all",
+                    choices=["all", "attn", "attn+norm"],
+                    help="Which PPT weights to load: 'all' = full transformer body (default), "
+                         "'attn' = only attention layers (c_q/c_k/c_v/c_proj/attn_gate), "
+                         "'attn+norm' = attention + skip/residual/x0 scalars. "
+                         "Paper shows MLP transfer hurts for text; 'attn' is recommended.")
 parser.add_argument("--max-train-time", type=float, default=None,
                     help="Max cumulative training step time in minutes (None = unlimited). "
                          "Counts only forward+backward pass time, excludes eval and checkpoint saving.")
@@ -818,7 +827,7 @@ else:
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
-_wandb_kwargs = {"project": "slowrun", "name": run_name}
+_wandb_kwargs = {"project": "nanochat", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
@@ -860,15 +869,30 @@ model.init_weights()
 
 # Load NCA pre-pre-trained weights (skipping embed + lm_head — different vocab sizes)
 if args.pretrained_ckpt:
-    print0(f"Loading NCA pre-pre-trained checkpoint: {args.pretrained_ckpt}")
+    print0(f"Loading NCA pre-pre-trained checkpoint: {args.pretrained_ckpt} (mode={args.nca_load_mode})")
     ckpt = torch.load(args.pretrained_ckpt, map_location="cpu", weights_only=True)
     ckpt.pop('config', None)  # remove metadata dict if present
-    skip_prefixes = ('transformer.wte.', 'lm_head.')
-    filtered = {k: v for k, v in ckpt.items()
-                if not any(k.startswith(p) for p in skip_prefixes)}
+    # Always skip embed + lm_head (vocab size mismatch)
+    skip_prefixes = ['transformer.wte.', 'lm_head.']
+    if args.nca_load_mode == 'attn':
+        # Only load attention weights — paper shows MLP transfer hurts for text
+        attn_keys = ('.attn.c_q.', '.attn.c_k.', '.attn.c_v.', '.attn.c_proj.',
+                     '.attn.attn_gate.', '.attn.ve_gate.')
+        filtered = {k: v for k, v in ckpt.items()
+                    if any(ak in k for ak in attn_keys)}
+    elif args.nca_load_mode == 'attn+norm':
+        # Attention + scalar params (residual lambdas, x0 lambdas, skip weights)
+        attn_keys = ('.attn.c_q.', '.attn.c_k.', '.attn.c_v.', '.attn.c_proj.',
+                     '.attn.attn_gate.', '.attn.ve_gate.')
+        scalar_keys = ('resid_lambdas', 'x0_lambdas', 'skip_weights')
+        filtered = {k: v for k, v in ckpt.items()
+                    if any(ak in k for ak in attn_keys) or any(k.startswith(sk) for sk in scalar_keys)}
+    else:  # 'all' — original behavior
+        filtered = {k: v for k, v in ckpt.items()
+                    if not any(k.startswith(p) for p in skip_prefixes)}
     missing, unexpected = model.load_state_dict(filtered, strict=False)
-    print0(f"  Loaded {len(filtered)} param tensors; skipped embed+lm_head (vocab size mismatch)")
-    print0(f"  Freshly initialized: {missing}")
+    print0(f"  Loaded {len(filtered)} param tensors (mode={args.nca_load_mode})")
+    print0(f"  Freshly initialized: {len(missing)} params")
     if unexpected:
         print0(f"  WARNING — unexpected keys: {unexpected}")
     del ckpt, filtered
@@ -976,14 +1000,21 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     # Update optimizer
     lrm = get_lr_multiplier(step)
     nca_warmup = args.nca_warmup_steps if args.pretrained_ckpt else 0
+    nca_rampup = args.nca_rampup_steps if nca_warmup > 0 else 0
     in_nca_warmup = nca_warmup > 0 and step <= nca_warmup
+    in_nca_rampup = nca_rampup > 0 and step > nca_warmup and step <= nca_warmup + nca_rampup
     if in_nca_warmup and step == 1:
         print0(f"NCA embedding warmup: freezing transformer body for {nca_warmup} steps")
     if nca_warmup > 0 and step == nca_warmup + 1:
-        print0(f"NCA embedding warmup complete at step {step - 1}; unfreezing transformer body")
+        print0(f"NCA embedding warmup complete at step {step - 1}; ramping up transformer body LR over {nca_rampup} steps")
+    if nca_rampup > 0 and step == nca_warmup + nca_rampup + 1:
+        print0(f"NCA rampup complete at step {step - 1}; full LR active")
     for group in optimizer.param_groups:
         if in_nca_warmup and not group.get('nca_embed', False):
             group["lr"] = 0.0
+        elif in_nca_rampup and not group.get('nca_embed', False):
+            rampup_frac = (step - nca_warmup) / nca_rampup
+            group["lr"] = group["initial_lr"] * lrm * rampup_frac
         else:
             group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
