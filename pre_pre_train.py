@@ -921,14 +921,9 @@ for epoch in range(args.num_epochs):
     for x, y in train_loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-        # Skip DDP gradient sync on all but the last micro-step to avoid
-        # (grad_accum_steps - 1) unnecessary all-reduces per optimizer step.
-        is_last_micro = (micro_step + 1) % grad_accum_steps == 0
-        _sync_ctx = nullcontext() if (is_last_micro or not ddp) else model.no_sync()
-        with _sync_ctx:
-            with autocast_ctx:
-                loss = model(x, y)
-            (loss / grad_accum_steps).backward()
+        with autocast_ctx:
+            loss = model(x, y)
+        (loss / grad_accum_steps).backward()
         loss_accum_t += loss.detach()
         micro_step += 1
 
