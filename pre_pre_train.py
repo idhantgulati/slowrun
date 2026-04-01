@@ -96,6 +96,11 @@ parser.add_argument("--max-wall-time", type=float, default=None,
                     help="Max total wall-clock time in minutes (None = unlimited). "
                          "Measured from script start, includes eval and data generation.")
 
+# Data regeneration
+parser.add_argument("--regen-data", action="store_true",
+                    help="Regenerate training data each epoch (fresh NCA trajectories, same rules). "
+                         "Matches the paper's --generate_train behaviour.")
+
 # Output
 parser.add_argument("--save-dir", type=str, default="nca_ckpts")
 parser.add_argument("--run", type=str, default=None)
@@ -846,14 +851,16 @@ steps_per_epoch  = max(1, (num_train_seqs // ddp_world_size) // args.device_batc
 num_total_steps  = steps_per_epoch * args.num_epochs
 print0(f"~{steps_per_epoch} steps/epoch × {args.num_epochs} epochs = ~{num_total_steps} total steps")
 
-# Generate ALL data once upfront — epochs just reshuffle
-print0("\nGenerating NCA training data (once)...")
-train_grids              = generate_nca_dataset(train_rules, args.sims_per_rule, num_examples,
-                                                 args.dT, args.init_rollout_steps, nca, epoch=0)
-train_tokens, train_tgts = tokenizer.encode(train_grids)
-# Trim to exactly num_train_seqs sequences (may generate slightly more due to ceil rounding)
-train_tokens = train_tokens[:num_train_seqs]
-train_tgts   = train_tgts[:num_train_seqs]
+def generate_train_data(epoch: int):
+    grids  = generate_nca_dataset(train_rules, args.sims_per_rule, num_examples,
+                                   args.dT, args.init_rollout_steps, nca, epoch=epoch)
+    toks, tgts = tokenizer.encode(grids)
+    toks, tgts = toks[:num_train_seqs], tgts[:num_train_seqs]
+    return toks, tgts
+
+# Generate initial training data (regenerated each epoch if --regen-data)
+print0("\nGenerating NCA training data...")
+train_tokens, train_tgts = generate_train_data(epoch=0)
 print0(f"Train: {train_tokens.shape[0]} sequences, {train_tokens.numel():,} tokens")
 
 print0("Generating NCA validation data (once)...")
@@ -892,11 +899,16 @@ smooth_loss     = 0.0
 total_step_time = 0.0
 gc_frozen       = False
 
-# Build dataset once — same data every epoch, only the shuffle order changes
 train_dataset = NCADataset(train_tokens, train_tgts, actual_seq_len, args.min_grid, grid_len)
 
 for epoch in range(args.num_epochs):
     print0(f"--- Epoch {epoch + 1}/{args.num_epochs} ---")
+
+    if args.regen_data and epoch > 0:
+        print0(f"  Regenerating training data (epoch {epoch + 1})...")
+        train_tokens, train_tgts = generate_train_data(epoch=epoch)
+        train_dataset = NCADataset(train_tokens, train_tgts, actual_seq_len, args.min_grid, grid_len)
+        print0(f"  Done: {train_tokens.shape[0]} sequences")
 
     if ddp:
         sampler = torch.utils.data.distributed.DistributedSampler(
