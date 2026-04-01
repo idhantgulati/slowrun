@@ -65,7 +65,7 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
-parser.add_argument("--num-models", type=int, default=10, help="Number of ensemble members")
+parser.add_argument("--num-models", type=int, default=20, help="Number of ensemble members")
 parser.add_argument("--checkpoint-base", type=str, default="checkpoints", help="Base directory for checkpoints")
 parser.add_argument("--resume", type=str, default=None, help="Run ID to resume from (e.g. 20250226_143000)")
 parser.add_argument("--distill-alpha", type=float, default=0.7, help="Weight for distillation loss (0=hard labels only, 1=soft labels only)")
@@ -729,10 +729,10 @@ def evaluate_bpb(model, batches, steps, token_bytes):
 @torch.no_grad()
 def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocast_ctx):
     """
-    Compute ensemble val loss by averaging logits across all checkpoints.
+    Compute ensemble val loss by averaging probabilities across all checkpoints.
 
-    For N models, the ensemble prediction is: softmax(mean(logits_1, ..., logits_N))
-    Loss is computed from these averaged logits against the ground truth targets.
+    For N models, the ensemble prediction is: mean(softmax(logits_1), ..., softmax(logits_N))
+    Loss is computed as -log(avg_prob[target]).
     """
     num_models = len(checkpoint_paths)
     print0(f"  Loading {num_models} model(s) into GPU memory...")
@@ -768,33 +768,30 @@ def evaluate_ensemble_bpb(checkpoint_paths, config, token_bytes, device, autocas
     batch_iter = iter(val_loader)
     for _ in range(ensemble_eval_steps):
         x, y, _ = next(batch_iter)
+        flat_y = y.view(-1)
 
-        # Average logits across all models
-        logits_sum = None
+        # Average target probabilities across all models
+        target_prob_sum = torch.zeros(flat_y.size(0), dtype=torch.float64, device=device)
         for model in ensemble_models:
             with autocast_ctx:
                 logits = model.forward_logits(x).float()
-            if logits_sum is None:
-                logits_sum = logits
-            else:
-                logits_sum.add_(logits)
-            del logits
-        avg_logits = logits_sum / num_models
+            probs = F.softmax(logits.view(-1, logits.size(-1)), dim=-1)
+            target_prob_sum += probs.gather(1, flat_y.clamp(min=0).unsqueeze(-1)).squeeze(-1).double()
+            del logits, probs
+        avg_prob = target_prob_sum / num_models
 
-        # Compute loss from the averaged logits
-        flat_logits = avg_logits.view(-1, avg_logits.size(-1))
-        flat_y = y.view(-1)
-        loss2d = F.cross_entropy(flat_logits, flat_y, ignore_index=-1, reduction='none')
+        # Compute loss as -log(avg_prob)
+        loss_per_pos = -torch.log(avg_prob + 1e-10)
 
         mask = flat_y != -1
-        total_loss += loss2d[mask].sum().double()
+        total_loss += loss_per_pos[mask].sum()
         total_tokens += mask.sum()
 
-        num_bytes2d = token_bytes[flat_y]
-        total_nats += (loss2d * (num_bytes2d > 0)).sum().double()
-        total_bytes += num_bytes2d.sum()
+        num_bytes2d = token_bytes[flat_y.clamp(min=0)]
+        total_nats += (loss_per_pos[mask] * (num_bytes2d[mask] > 0).double()).sum()
+        total_bytes += num_bytes2d[mask].sum()
 
-        del logits_sum, avg_logits
+        del target_prob_sum, avg_prob
 
     # Cleanup all models
     del ensemble_models
@@ -1376,12 +1373,14 @@ def main():
         individual_results.append({"model": model_idx + 1, "seed": seeds[model_idx],
                                     "val_bpb": best_bpb, "val_loss": best_loss})
 
-        # Compute ensemble val loss (for k=1, just use individual; for k>=2, average logits)
+        # Compute ensemble val loss using last 7 models (7 * ~7GB = ~49GB fits in 80GB GPU)
         num_models_so_far = model_idx + 1
-        print0(f"\nEvaluating ensemble of {num_models_so_far} model(s)...")
+        max_ensemble_gpu = 7
+        eval_paths = checkpoint_paths[-max_ensemble_gpu:] if len(checkpoint_paths) > max_ensemble_gpu else checkpoint_paths
+        print0(f"\nEvaluating ensemble of {len(eval_paths)} model(s) (of {num_models_so_far} total)...")
 
         ens_bpb, ens_loss = evaluate_ensemble_bpb(
-            checkpoint_paths=checkpoint_paths,
+            checkpoint_paths=eval_paths,
             config=config,
             token_bytes=token_bytes,
             device=device,
@@ -1400,8 +1399,11 @@ def main():
         # Ensemble excluding model 0 — this is the reported ensemble metric,
         # since model 0 (no distillation teacher, fewer epochs) hurts ensemble quality.
         if len(checkpoint_paths) >= 2:
+            nf_paths = checkpoint_paths[1:]
+            if len(nf_paths) > max_ensemble_gpu:
+                nf_paths = nf_paths[-max_ensemble_gpu:]
             ens_nf_bpb, ens_nf_loss = evaluate_ensemble_bpb(
-                checkpoint_paths=checkpoint_paths[1:],
+                checkpoint_paths=nf_paths,
                 config=config,
                 token_bytes=token_bytes,
                 device=device,
@@ -1415,6 +1417,21 @@ def main():
                 "ensemble_no_first/val_loss": ens_nf_loss,
             })
 
+    # Final ensemble evaluation: last 7 models (prob averaging)
+    max_ensemble_gpu = 7
+    final_paths = checkpoint_paths[-max_ensemble_gpu:]
+    print0(f"\n{'='*60}")
+    print0(f"Final ensemble eval: last {len(final_paths)} models (prob averaging)")
+    print0(f"{'='*60}")
+    final_bpb, final_loss = evaluate_ensemble_bpb(
+        checkpoint_paths=final_paths,
+        config=config,
+        token_bytes=token_bytes,
+        device=device,
+        autocast_ctx=autocast_ctx,
+    )
+    print0(f"  Val BPB: {final_bpb:.6f} | Val Loss: {final_loss:.6f}")
+
     # Final summary
     print0(f"\n{'='*60}")
     print0(f"Ensemble Training Complete")
@@ -1425,14 +1442,15 @@ def main():
     print0(f"\nRunning ensemble results:")
     for r in ensemble_results:
         print0(f"  Ensemble ({r['num_models']} models): BPB={r['ensemble_bpb']:.6f}, Loss={r['ensemble_loss']:.6f}")
+    print0(f"\n*** Final result (last {len(final_paths)} models, prob avg): BPB={final_bpb:.6f} | Val Loss={final_loss:.6f} ***")
 
     # Save results
     if args.save_result and master_process:
         result = {
             "individual_models": individual_results,
             "ensemble_results": ensemble_results,
-            "final_ensemble_bpb": ensemble_results[-1]["ensemble_bpb"],
-            "final_ensemble_loss": ensemble_results[-1]["ensemble_loss"],
+            "final_ensemble_bpb": final_bpb,
+            "final_ensemble_loss": final_loss,
         }
         with open(args.save_result, "w") as f:
             json.dump(result, f, indent=2)
