@@ -93,6 +93,8 @@ parser.add_argument("--max-train-time", type=float, default=None,
 parser.add_argument("--max-wall-time", type=float, default=None,
                     help="Max total wall-clock time in minutes (None = unlimited). "
                          "Measured from script start, includes eval and checkpoint saving.")
+parser.add_argument("--swa-last-epochs", type=int, default=3,
+                    help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -317,10 +319,11 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            normal_std = self.config.n_embd ** -0.5
+            torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=normal_std)
             torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
         self.resid_lambdas.fill_(1.0)
         self.x0_lambdas.fill_(0.1)
         for proj in self.ve_projs.values():
@@ -943,6 +946,9 @@ def get_lr_multiplier(it):
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
+steps_per_epoch = num_iterations / args.num_epochs
+_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
+
 # Training loop
 step = 0
 min_val_bpb = float("inf")
@@ -1009,6 +1015,11 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         print0(f"NCA embedding warmup complete at step {step - 1}; ramping up transformer body LR over {nca_rampup} steps")
     if nca_rampup > 0 and step == nca_warmup + nca_rampup + 1:
         print0(f"NCA rampup complete at step {step - 1}; full LR active")
+    # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
+    if _swa_start_step >= 0 and step >= _swa_start_step:
+        cycle_pos = (step - _swa_start_step) % steps_per_epoch
+        swa_base = max(lrm, 0.05)
+        lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
     for group in optimizer.param_groups:
         if in_nca_warmup and not group.get('nca_embed', False):
             group["lr"] = 0.0

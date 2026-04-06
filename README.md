@@ -46,6 +46,8 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 10 | 3.270 | LR tuning, warmdown tuning | 03/16/26 | 55.5 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/28152d9996d9e910d4fb1b4a569fae399c546d6b/train.py) | [@zhiweixx](https://x.com/zhiweixux)
 11 | 3.252 | EMA of weights, hyperparameter tuning | 03/18/26 | 59.2 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/3fb4428f67e77e3bec53d4eafbb2cfd6f999b684/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak), [@ms337](https://x.com/madhavsinghal_)
 12 | 3.248 | Use weighted average of last 3 epoch checkpoints | 03/23/26 | 58.2 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/20117fb36e62b65e96997268883f0b789a85e75d/train.py) | [@not-nonymous](https://github.com/not-nonymous)
+13 | 3.236 | Add [Stochastic Weight Averaging (SWA)](https://arxiv.org/pdf/1803.05407) | 04/01/26 | 58.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/5f39cd82fbe58c5a0ab67af2f60a09e6356b88fe/train.py) | [@shmublu](https://x.com/ShmuelBerman)
+14 | 3.230 | Switch c_proj init from zero to normal | 04/02/26 | 58.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/146042209ac9ffeff7809f721b2c95dbc6ef87d9/train.py) | [@ms337](https://x.com/madhavsinghal_)
 
 
 ### Tiny Track (15 minutes)
@@ -62,6 +64,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 6 | 3.374 | Half truncated RoPE, partial key offset, residual lambdas to 1.1 | 03/06/26 | 14.8 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/ed62160275273197c3a996c4469d735a05c5eedb/tiny/train.py) | [@ChinmayK0607](https://x.com/ChinmayKak)
 7 | 3.365 | Add weight decay schedule | 03/15/26 | 14.8 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/42c39127d19bebbb806afd630fa852936da35562/tiny/train.py) | [@shmublu](https://x.com/ShmuelBerman)
 8 | 3.353 | Add EMA parameter averaging | 03/18/26 | 14.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/0092945e4bf570fdb90fbdf2f1b311361288ea0b/tiny/train.py) | [@clarkkev](https://github.com/clarkkev)
+9 | 3.345 | Add [Stochastic Weight Averaging (SWA)](https://arxiv.org/pdf/1803.05407) | 04/01/26 | 14.6 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/e094217e7a1abffae5b3ee06737b6d1747d76a48/tiny/train.py) | [@shmublu](https://x.com/ShmuelBerman)
 
 
 
@@ -82,6 +85,7 @@ The tiny track caps runs at a single 8xH100 node for at most 15 minutes.
 7 | 3.089 | Ensemble of 10 models, looping of layers 15-20, tuned epoch counts, loss weight | 03/13/26 | 19h 18m (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/5c6ecd540cd789eef50fe894302da82b670fcc93/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
 8 | 3.081 | Ensemble of 12 models, distill alpha 0.5 | 03/18/26 | 42h 35m (1 node, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/7dc6c386ae6ccf8bc8fa9b03cc53acf7723c4084/unlimited/train.py) | [@not-nonymous](https://github.com/not-nonymous)
 9 | 3.045 | More looping, hyperparam tuning, model size increase | 03/19/26 | ~44h (2 nodes, 8xH100) | [Script](https://github.com/qlabs-eng/slowrun/blob/fcfb67b230afcf2e1702936abc077defcf5f8657/unlimited/train.py) | [@akshayvegesna](https://x.com/akshayvegesna)
+10 | 3.024 | Use probability averaging over logit averaging, train 20 models | 03/31/26 | 210 hours (7xH100 node) | [Script](https://github.com/qlabs-eng/slowrun/blob/dceb3e9d5b6153058b8dadf36af84f6a7c622fdf/unlimited/train.py) | [@L-z-Chen](https://x.com/lzchen_ut)
 
 
 
