@@ -21,17 +21,19 @@ sleep 5
 
 # Phase 2: Language Training
 WANDB_MODE=online torchrun --standalone --nproc_per_node=8 train.py \
-    --run lang-pre-train-v8 \
+    --run lang-pre-train-v10 \
     --pretrained-ckpt nca_ckpts/ppt_v8/nca_pretrained_best.pt \
     --n_embd 2560 --n_head 20 --n_layer 30 \
     --num-epochs 25 \
     --total-batch-size 524288 \
-    --lr_multiplier 0.3 \
-    --weight-decay 1.6 \
+    --lr_multiplier 0.25 \
+    --weight-decay 1.3 \
     --dropout 0.1 \
     --nca-load-mode attn \
     --nca-warmup-steps 250 --nca-rampup-steps 200 \
-    --warmdown-ratio 0.25 \
-    --dupe-start-epoch 12
+    --warmdown-ratio 0.2 \
+    --dupe-start-epoch 12 \
+    --logit-avg 5 \
+    --swa-last-epochs 4
 
 echo "Language training done"
