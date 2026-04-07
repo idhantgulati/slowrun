@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from contextlib import nullcontext
 
 import torch
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -74,6 +76,8 @@ parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
 parser.add_argument("--swa-last-epochs", type=int, default=3,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+parser.add_argument("--stoch-depth", type=float, default=0.05,
+                    help="Stochastic depth max drop rate (linear schedule, 0=off)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -179,6 +183,7 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.0
+    stoch_depth: float = 0.05
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -248,10 +253,20 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
+        self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
+        if self.training and self.drop_prob > 0:
+            keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
+            x_in = x
+            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.mlp(norm(x))
+            x = x_in + keep * (x - x_in)
+        else:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.mlp(norm(x))
         return x
 
 
@@ -277,7 +292,7 @@ class GPT(nn.Module):
         self.encoder_layers = config.n_layer // 2
         self.skip_weights = nn.Parameter(torch.ones(self.encoder_layers))
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self._dupe_layers = None  # (start, end) or None
@@ -313,8 +328,9 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
+        cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim, base=10000)
+        self.cos = cos
+        self.sin = sin
         if self.transformer.wte.weight.device.type == "cuda":
             self.transformer.wte.to(dtype=torch.bfloat16)
 
@@ -383,8 +399,9 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_decoder_layers(self, x, x0, cos_sin, encoder_outputs, start, end):
+    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
         """Run decoder layers [start, end), with U-Net skip connections."""
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
         for i in range(start, end):
             # Encoder layer j connects to decoder layer (n_layer - 1 - j)
             j = self.config.n_layer - 1 - i
@@ -397,9 +414,9 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
@@ -412,19 +429,19 @@ class GPT(nn.Module):
         # Decoder half
         dupe = self._dupe_layers
         if dupe is None:
-            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        self.encoder_layers, self.config.n_layer)
+            x = self._run_decoder_layers(x, x0, encoder_outputs,
+                                        self.encoder_layers, self.config.n_layer, T)
         else:
             # First pass: encoder boundary through end of dupe range
-            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        self.encoder_layers, dupe[1])
+            x = self._run_decoder_layers(x, x0, encoder_outputs,
+                                        self.encoder_layers, dupe[1], T)
             # Extra replays through dupe range
             for _ in range(self._dupe_loops):
-                x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                            dupe[0], dupe[1])
+                x = self._run_decoder_layers(x, x0, encoder_outputs,
+                                            dupe[0], dupe[1], T)
             # Remaining decoder layers
-            x = self._run_decoder_layers(x, x0, cos_sin, encoder_outputs,
-                                        dupe[1], self.config.n_layer)
+            x = self._run_decoder_layers(x, x0, encoder_outputs,
+                                        dupe[1], self.config.n_layer, T)
 
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
@@ -819,6 +836,7 @@ if master_process:
 print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
+print0(f"  stoch_depth={args.stoch_depth}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
@@ -842,7 +860,8 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
+                   stoch_depth=args.stoch_depth)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
