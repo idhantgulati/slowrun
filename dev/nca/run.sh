@@ -37,3 +37,17 @@ WANDB_MODE=online torchrun --standalone --nproc_per_node=8 train.py \
     --swa-last-epochs 6
 
 echo "Language training done"
+
+# w/o NCA training 
+WANDB_MODE=online torchrun --standalone --nproc_per_node=8 train.py \
+    --run lang-pre-train-v11-no-nca \
+    --n_embd 2560 --n_head 20 --n_layer 30 \
+    --num-epochs 25 \
+    --total-batch-size 524288 \
+    --lr_multiplier 0.25 \
+    --weight-decay 1.3 \
+    --dropout 0.1 \
+    --warmdown-ratio 0.2 \
+    --dupe-start-epoch 12 \
+    --logit-avg 7 \
+    --swa-last-epochs 6
